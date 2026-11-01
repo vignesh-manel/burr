@@ -21,7 +21,7 @@ import dataclasses
 import inspect
 import types
 from functools import singledispatch
-from typing import TYPE_CHECKING, Any, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional, Union
 
 if TYPE_CHECKING:
     from burr.core.artifacts import ArtifactStore, AsyncArtifactStore
@@ -55,10 +55,25 @@ class SerializationContext:
             ref = store.put_artifact(value.to_bytes(), media_type="application/pdf")
             return {serde.KEY: "pdf", "ref": serde.serialize(ref)}
 
+    One context belongs to one :py:class:`~burr.core.application.Application` and is shared by
+    every step of that application, by its persister and tracker, and by the load that resumes it.
+    Two applications never share one.
+
     :param object_store: The application's configured artifact store, if any.
+    :param memo: Per-application scratch space for serializers to cache by content hash, so an
+        unchanged value costs one in-memory hash and no store I/O. Burr does not interpret it.
+        Use it as a cache key, not as an identity key: if a serialized payload carries anything
+        besides the artifact reference (a filename, a media type, a row count), either recompute
+        that part on every call or include it in the key -- two values with identical content and
+        different metadata otherwise resume with each other's metadata. The deserializer of the
+        matching key should re-seed it on resume so the first persist after a resume is free.
     """
 
     object_store: Optional[Union["ArtifactStore", "AsyncArtifactStore"]] = None
+    # ``compare``/``hash`` are off so the context keeps the identity and hashability it had before
+    # the memo existed: it is equal to another context wrapping the same store, and a memo (a mutable
+    # dict) does not participate in comparisons or hashing.
+    memo: Dict[str, Any] = dataclasses.field(default_factory=dict, compare=False, hash=False)
 
     def require_object_store(self) -> Union["ArtifactStore", "AsyncArtifactStore"]:
         """Returns the configured object store, raising a clear error if there is none.
