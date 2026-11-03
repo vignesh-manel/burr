@@ -852,8 +852,14 @@ def _create_default_executor() -> Executor:
 def _serialization_context_factory(
     object_store: Optional[Union[ArtifactStore, AsyncArtifactStore]],
 ) -> Callable[[], ContextManager]:
-    """Returns a factory for a context manager that makes ``object_store`` available to
-    serializers."""
+    """Returns a factory for a context manager that makes ``object_store`` available to serializers.
+
+    Each call creates a new :py:class:`~burr.core.serde.SerializationContext`, so each call site
+    gets its own ``memo``. Use :py:meth:`ApplicationBuilder._serialization_hook_context` to build one
+    context for a whole application instead of calling this repeatedly -- the initializer load and the
+    application's hooks must share a context for anything the deserializer seeds on resume to be
+    visible to the next persist.
+    """
     context = (
         serde.SerializationContext(object_store=object_store) if object_store is not None else None
     )
@@ -880,6 +886,7 @@ class Application(Generic[ApplicationStateType]):
         state_persister: Union[BaseStateSaver, LifecycleAdapter, None] = None,
         state_initializer: Union[BaseStateLoader, LifecycleAdapter, None] = None,
         object_store: Optional[Union[ArtifactStore, AsyncArtifactStore]] = None,
+        hook_context: Optional[Callable[[], ContextManager]] = None,
     ):
         """Instantiates an Application. This is an internal API -- use the builder!
 
@@ -893,6 +900,10 @@ class Application(Generic[ApplicationStateType]):
             So if this starts at 0, the first one you will see will be 1.
         :param adapter_set: Set of lifecycle adapters
         :param builder: Builder that created this application
+        :param hook_context: Factory for the serialization-context manager the builder already
+            created, so that the application's hooks resume/serialize with the *same*
+            :py:class:`~burr.core.serde.SerializationContext` the initializer load used. Built here
+            from ``object_store`` when not supplied.
         """
         self._partition_key = partition_key
         self._uid = uid
@@ -909,7 +920,7 @@ class Application(Generic[ApplicationStateType]):
         if object_store is not None:
             # persisters/trackers serialize state inside hooks -- this hands them the object store
             adapter_set = adapter_set.with_hook_context(
-                _serialization_context_factory(object_store)
+                hook_context or _serialization_context_factory(object_store)
             )
         self._adapter_set = adapter_set.with_new_adapters(TracerFactoryContextHook(adapter_set))
         # TODO -- consider adding global inputs + global input factories to the builder
@@ -2645,6 +2656,21 @@ class ApplicationBuilder(Generic[StateType]):
         self.object_store = object_store
         return self
 
+    def _serialization_hook_context(self) -> Optional[Callable[[], ContextManager]]:
+        """Creates the one :py:class:`~burr.core.serde.SerializationContext` for a single build.
+
+        Called once per :py:meth:`build` / :py:meth:`abuild`, and the result is handed to both the
+        initializer load and the resulting :py:class:`Application`, so that a value the deserializer
+        seeds on resume is visible to the application's first persist. A new build gets a new
+        context (and therefore a new ``memo``), even when the same builder is reused.
+
+        :return: A factory for the context manager, or ``None`` when no object store is configured.
+        """
+        if self.object_store is None:
+            return None
+        context = serde.SerializationContext(object_store=self.object_store)
+        return lambda: serde.serialization_context(context)
+
     def with_spawning_parent(
         self, app_id: str, sequence_id: int, partition_key: Optional[str] = None
     ) -> "ApplicationBuilder[StateType]":
@@ -2792,7 +2818,7 @@ class ApplicationBuilder(Generic[StateType]):
                 # self.start is already set to the default. We don't need to do anything.
                 pass
 
-    def _load_from_sync_persister(self):
+    def _load_from_sync_persister(self, hook_context=None):
         """Loads from the set sync persister and into this current object.
 
         Mutates:
@@ -2800,6 +2826,9 @@ class ApplicationBuilder(Generic[StateType]):
          - self.sequence_id
          - maybe self.start
 
+        :param hook_context: The application's serialization-context factory, so deserializers
+            seeding anything on resume write to the context the built application will use.
+            Defaults to a throwaway one when not given.
         """
         if self.state_initializer.is_async():
             raise ValueError(
@@ -2811,11 +2840,11 @@ class ApplicationBuilder(Generic[StateType]):
         _partition_key, _app_id, _sequence_id = self._identify_state_to_load()
 
         # load state from persister
-        with _serialization_context_factory(self.object_store)():
+        with (hook_context or _serialization_context_factory(self.object_store))():
             load_result = self.state_initializer.load(_partition_key, _app_id, _sequence_id)
         self._init_state_from_persister(load_result, _partition_key, _app_id, _sequence_id)
 
-    async def _load_from_async_persister(self):
+    async def _load_from_async_persister(self, hook_context=None):
         """Loads from the set async persister and into this current object.
 
         Mutates:
@@ -2823,6 +2852,8 @@ class ApplicationBuilder(Generic[StateType]):
          - self.sequence_id
          - maybe self.start
 
+        :param hook_context: The application's serialization-context factory -- see
+            :py:meth:`_load_from_sync_persister`.
         """
         if not self.state_initializer.is_async():
             raise ValueError(
@@ -2834,7 +2865,7 @@ class ApplicationBuilder(Generic[StateType]):
         _partition_key, _app_id, _sequence_id = self._identify_state_to_load()
 
         # load state from persister
-        with _serialization_context_factory(self.object_store)():
+        with (hook_context or _serialization_context_factory(self.object_store))():
             load_result = await self.state_initializer.load(_partition_key, _app_id, _sequence_id)
         self._init_state_from_persister(load_result, _partition_key, _app_id, _sequence_id)
 
@@ -2850,7 +2881,7 @@ class ApplicationBuilder(Generic[StateType]):
             )
         return self.graph_builder.build()
 
-    def _build_common(self) -> Application:
+    def _build_common(self, hook_context=None) -> Application:
         graph = self._get_built_graph()
         _validate_start(self.start, {action.name for action in graph.actions})
         typing_system: TypingSystem[StateType] = (
@@ -2889,6 +2920,7 @@ class ApplicationBuilder(Generic[StateType]):
             state_persister=self.state_persister,
             state_initializer=self.state_initializer,
             object_store=self.object_store,
+            hook_context=hook_context,
         )
 
     def build(self) -> Application[StateType]:
@@ -2928,13 +2960,16 @@ class ApplicationBuilder(Generic[StateType]):
         if self.state is None:
             self.state = State()
 
+        hook_context = self._serialization_hook_context()
         if self.state_persister:
             self._set_sync_state_persister()  # this is used to save the state during application run
         if self.state_initializer:
             # sets state, sequence_id, and maybe start
-            self._load_from_sync_persister()  # this is used to load application from a previously saved state
+            self._load_from_sync_persister(
+                hook_context
+            )  # this is used to load application from a previously saved state
 
-        return self._build_common()
+        return self._build_common(hook_context)
 
     async def abuild(self) -> Application[StateType]:
         """Builds the application for asynchronous runs.
@@ -2976,14 +3011,15 @@ class ApplicationBuilder(Generic[StateType]):
         if self.state is None:
             self.state = State()
 
+        hook_context = self._serialization_hook_context()
         if self.state_persister:
             await self._set_async_state_persister()  # this is used to save the state during application run
 
         if self.state_initializer:
             # sets state, sequence_id, and maybe start
-            await self._load_from_async_persister()  # this is used to load application from a previously saved state
+            await self._load_from_async_persister(hook_context)  # used to load from a previous run
 
-        return self._build_common()
+        return self._build_common(hook_context)
 
     @property
     def is_async(self) -> bool:

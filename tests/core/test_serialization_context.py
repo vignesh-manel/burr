@@ -18,7 +18,9 @@
 """Tests for the serialization context: how the application's object store reaches type-based and
 field-based serializers across persistence, resume, tracking, sub-applications, and async."""
 
+import dataclasses
 import glob
+import hashlib
 import json
 import os
 import sqlite3
@@ -623,3 +625,448 @@ async def test_sync_tracker_with_async_serializer_fails_clearly(tmp_path):
     )
     with pytest.raises(ValueError, match="asynchronous"):
         await app.astep()
+
+
+# --- the per-application serialization context (one context per Application) ---
+#
+# A SerializationContext carries a `memo`, so its identity is now load-bearing: the load that
+# resumes an application and every persist/track that application later does must run inside the
+# *same* context, or anything the deserializer seeds is thrown away with the load-time object.
+# One context per build, never a process-wide one.
+
+
+class MemoBlob:
+    """A large value whose serde externalizes bytes and caches the reference by content hash.
+
+    This is the "hash-then-skip" pattern: hash in memory, check the memo, do I/O only on a miss.
+    The memo holds the store-side fact (the ArtifactRef), not the payload, so per-value metadata
+    (``name`` here) is always rebuilt from the live value -- two blobs with the same bytes but
+    different metadata do not collapse onto one another.
+    """
+
+    def __init__(self, data: bytes, name: str = "blob"):
+        self.data = data
+        self.name = name
+
+    def __eq__(self, other):
+        return isinstance(other, MemoBlob) and (other.data, other.name) == (self.data, self.name)
+
+
+class TrackedStore(LocalFileSystemArtifactStore):
+    """Counts every backend call so a test can assert that an unchanged value costs nothing."""
+
+    def __init__(self, root_dir: str):
+        super().__init__(root_dir)
+        self.ops = []
+
+    def put(self, data, key):
+        self.ops.append(("put", len(data)))
+        return super().put(data, key)
+
+    def get(self, key):
+        data = super().get(key)
+        self.ops.append(("get", len(data)))
+        return data
+
+    def exists(self, key):
+        self.ops.append(("exists", 0))
+        return super().exists(key)
+
+    def digest(self, key):
+        self.ops.append(("digest", 0))
+        return super().digest(key)
+
+
+class CountedAsyncStore(InMemoryAsyncStore):
+    """In-memory async store that counts every backend call."""
+
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    async def put(self, data, key):
+        self.ops.append(("put", len(data)))
+        return await super().put(data, key)
+
+    async def get(self, key):
+        self.ops.append(("get", len(self.data.get(key, b""))))
+        return await super().get(key)
+
+    async def exists(self, key):
+        self.ops.append(("exists", 0))
+        return await super().exists(key)
+
+
+def _register_memo_blob_serde(key: str) -> None:
+    """Registers a hash-then-skip serde pair under a test-unique envelope key."""
+
+    @serde.serialize.register(MemoBlob)
+    def _serialize_memo_blob(value, serialization_context=None, **kwargs):
+        h = hashlib.sha256(value.data).hexdigest()
+        ref = serialization_context.memo.get(h)
+        if ref is None:
+            ref = serialization_context.require_object_store().put_artifact(value.data)
+            serialization_context.memo[h] = ref
+        return {serde.KEY: key, "ref": serde.serialize(ref), "name": value.name, "hash": h}
+
+    @serde.deserializer.register(key)
+    def _deserialize_memo_blob(value, serialization_context=None, **kwargs):
+        ref = serde.deserialize(value["ref"])
+        blob = MemoBlob(
+            data=ref.read(serialization_context.require_object_store()), name=value["name"]
+        )
+        serialization_context.memo[value["hash"]] = ref
+        return blob
+
+
+def _register_async_memo_blob_serde(key: str) -> None:
+    """Async counterpart of _register_memo_blob_serde -- same lifecycle guarantee."""
+
+    @serde.serialize.register(MemoBlob)
+    async def _serialize_memo_blob(value, serialization_context=None, **kwargs):
+        h = hashlib.sha256(value.data).hexdigest()
+        ref = serialization_context.memo.get(h)
+        if ref is None:
+            ref = await serialization_context.require_object_store().put_artifact(value.data)
+            serialization_context.memo[h] = ref
+        return {serde.KEY: key, "ref": serde.serialize(ref), "name": value.name, "hash": h}
+
+    @serde.deserializer.register(key)
+    async def _deserialize_memo_blob(value, serialization_context=None, **kwargs):
+        ref = serde.deserialize(value["ref"])
+        blob = MemoBlob(
+            data=await ref.aread(serialization_context.require_object_store()),
+            name=value["name"],
+        )
+        serialization_context.memo[value["hash"]] = ref
+        return blob
+
+
+MEMO_BYTES = b"a contract worth storing " * 20
+
+
+@action(reads=[], writes=["memo_blob"])
+def produce_memo(state: State) -> State:
+    return state.update(memo_blob=MemoBlob(MEMO_BYTES, name="contract.pdf"))
+
+
+@action(reads=["memo_blob"], writes=["memo_size"])
+def consume_memo(state: State) -> State:
+    return state.update(memo_size=len(state["memo_blob"].data))
+
+
+@action(reads=[], writes=["memo_blob"])
+async def aproduce_memo(state: State) -> State:
+    return state.update(memo_blob=MemoBlob(MEMO_BYTES, name="contract.pdf"))
+
+
+@action(reads=["memo_blob"], writes=["memo_size"])
+async def aconsume_memo(state: State) -> State:
+    return state.update(memo_size=len(state["memo_blob"].data))
+
+
+SYNC_MEMO = {
+    "actions": {"produce_memo": produce_memo, "consume_memo": consume_memo},
+    "transitions": (("produce_memo", "consume_memo"), ("consume_memo", "produce_memo")),
+    "entrypoint": "produce_memo",
+    "halt_after": "consume_memo",
+}
+ASYNC_MEMO = {
+    "actions": {"aproduce_memo": aproduce_memo, "aconsume_memo": aconsume_memo},
+    "transitions": (("aproduce_memo", "aconsume_memo"), ("aconsume_memo", "aproduce_memo")),
+    "entrypoint": "aproduce_memo",
+    "halt_after": "aconsume_memo",
+}
+
+
+def _build_memo_app(store, app_id, shape, persister=None, tracker=None, resume=False):
+    builder = (
+        ApplicationBuilder()
+        .with_actions(**shape["actions"])
+        .with_transitions(*shape["transitions"])
+        .with_identifiers(app_id=app_id, partition_key="pk")
+        .with_object_store(store)
+    )
+    if persister is not None:
+        builder = builder.with_state_persister(persister)
+    if tracker is not None:
+        builder = builder.with_tracker(tracker)
+    if resume:
+        return builder.initialize_from(
+            persister,
+            resume_at_next_action=True,
+            default_state={},
+            default_entrypoint=shape["entrypoint"],
+        )
+    return builder.with_entrypoint(shape["entrypoint"])
+
+
+def _app_context(app) -> SerializationContext:
+    """The one SerializationContext the application installed for its hook dispatches."""
+    factory = app._adapter_set._hook_context
+    assert factory is not None, "an application with an object store must install a hook context"
+    cells = [
+        cell.cell_contents
+        for cell in (getattr(factory, "__closure__", None) or ())
+        if isinstance(cell.cell_contents, SerializationContext)
+    ]
+    assert len(cells) == 1, cells
+    return cells[0]
+
+
+def test_sync_resume_seeds_a_memo_the_first_persist_can_use(tmp_path):
+    """The point of the memo: an unchanged artifact costs nothing after a resume."""
+    _register_memo_blob_serde("test_memo_sync_resume")
+    store = TrackedStore(str(tmp_path / "blobs"))
+    persister = SQLitePersister.from_values(db_path=str(tmp_path / "state.db"), table_name="t")
+    persister.initialize()
+
+    app = _build_memo_app(store, "memo-sync", SYNC_MEMO, persister=persister).build()
+    app.run(halt_after=[SYNC_MEMO["halt_after"]])
+    assert ("put", len(MEMO_BYTES)) in store.ops, store.ops
+    store.ops.clear()
+
+    resumed = _build_memo_app(
+        store, "memo-sync", SYNC_MEMO, persister=persister, resume=True
+    ).build()
+    assert resumed.state["memo_blob"].data == MEMO_BYTES
+    assert ("get", len(MEMO_BYTES)) in store.ops  # the load itself downloads it
+    store.ops.clear()
+
+    resumed.run(halt_after=[SYNC_MEMO["halt_after"]])  # re-persists the unchanged value, twice
+    assert store.ops == [], store.ops
+    persister.cleanup()
+
+
+async def test_async_resume_seeds_a_memo_the_first_persist_can_use(tmp_path):
+    """Same lifecycle guarantee on the async path (async store + async serde + async persister)."""
+    from burr.integrations.persisters.b_aiosqlite import AsyncSQLitePersister
+
+    _register_async_memo_blob_serde("test_memo_async_resume")
+    store = CountedAsyncStore()
+    persister = await AsyncSQLitePersister.from_values(
+        db_path=str(tmp_path / "astate.db"), table_name="t"
+    )
+    await persister.initialize()
+
+    app = await _build_memo_app(store, "memo-async", ASYNC_MEMO, persister=persister).abuild()
+    await app.arun(halt_after=[ASYNC_MEMO["halt_after"]])
+    assert ("put", len(MEMO_BYTES)) in store.ops, store.ops
+    store.ops.clear()
+
+    resumed = await _build_memo_app(
+        store, "memo-async", ASYNC_MEMO, persister=persister, resume=True
+    ).abuild()
+    assert resumed.state["memo_blob"].data == MEMO_BYTES
+    assert ("get", len(MEMO_BYTES)) in store.ops
+    store.ops.clear()
+
+    await resumed.arun(halt_after=[ASYNC_MEMO["halt_after"]])
+    assert store.ops == [], store.ops
+    await persister.cleanup()
+
+
+def test_load_and_hooks_share_one_context_sync(tmp_path):
+    """Identity: the context the deserializer saw is the one the application's hooks use."""
+    _register_memo_blob_serde("test_identity_sync")
+    seen = {"serialize": [], "deserialize": []}
+    inner_serialize = serde.serialize.dispatch(MemoBlob)
+
+    @serde.serialize.register(MemoBlob)
+    def _capture(value, serialization_context=None, **kwargs):
+        seen["serialize"].append(serialization_context)
+        return inner_serialize(value, serialization_context=serialization_context, **kwargs)
+
+    inner_deserialize = serde.deserializer.func_map["test_identity_sync"]
+
+    @serde.deserializer.register("test_identity_sync")
+    def _capture_de(value, serialization_context=None, **kwargs):
+        seen["deserialize"].append(serialization_context)
+        return inner_deserialize(value, serialization_context=serialization_context, **kwargs)
+
+    store = TrackedStore(str(tmp_path / "blobs2"))
+    persister = SQLitePersister.from_values(db_path=str(tmp_path / "identity.db"), table_name="t")
+    persister.initialize()
+    _build_memo_app(store, "identity", SYNC_MEMO, persister=persister).build().run(
+        halt_after=[SYNC_MEMO["halt_after"]]
+    )
+
+    cold_serializes = len(seen["serialize"])
+    resumed = _build_memo_app(
+        store, "identity", SYNC_MEMO, persister=persister, resume=True
+    ).build()
+    resumed.run(halt_after=[SYNC_MEMO["halt_after"]])
+
+    assert len(seen["deserialize"]) == 1, "the resumed load must have run the deserializer once"
+    load_ctx = seen["deserialize"][0]
+    assert load_ctx is _app_context(resumed), (
+        "the load-time context must be the very object the application's hooks install, or "
+        "anything the deserializer seeded on it is discarded"
+    )
+    post_resume = seen["serialize"][cold_serializes:]
+    assert post_resume, "the resumed run must have serialized"
+    assert all(ctx is load_ctx for ctx in post_resume), post_resume
+    persister.cleanup()
+
+
+async def test_load_and_hooks_share_one_context_async(tmp_path):
+    from burr.integrations.persisters.b_aiosqlite import AsyncSQLitePersister
+
+    _register_async_memo_blob_serde("test_identity_async")
+    seen = {"serialize": [], "deserialize": []}
+    inner_serialize = serde.serialize.dispatch(MemoBlob)
+
+    @serde.serialize.register(MemoBlob)
+    async def _capture(value, serialization_context=None, **kwargs):
+        seen["serialize"].append(serialization_context)
+        return await inner_serialize(value, serialization_context=serialization_context, **kwargs)
+
+    inner_deserialize = serde.deserializer.func_map["test_identity_async"]
+
+    @serde.deserializer.register("test_identity_async")
+    async def _capture_de(value, serialization_context=None, **kwargs):
+        seen["deserialize"].append(serialization_context)
+        return await inner_deserialize(value, serialization_context=serialization_context, **kwargs)
+
+    store = CountedAsyncStore()
+    persister = await AsyncSQLitePersister.from_values(
+        db_path=str(tmp_path / "identity_async.db"), table_name="t"
+    )
+    await persister.initialize()
+    app = await _build_memo_app(store, "identity-a", ASYNC_MEMO, persister=persister).abuild()
+    await app.arun(halt_after=[ASYNC_MEMO["halt_after"]])
+    cold_serializes = len(seen["serialize"])
+
+    resumed = await _build_memo_app(
+        store, "identity-a", ASYNC_MEMO, persister=persister, resume=True
+    ).abuild()
+    await resumed.arun(halt_after=[ASYNC_MEMO["halt_after"]])
+
+    assert len(seen["deserialize"]) == 1
+    load_ctx = seen["deserialize"][0]
+    assert load_ctx is _app_context(resumed)
+    post_resume = seen["serialize"][cold_serializes:]
+    assert post_resume, "the resumed run must have serialized"
+    assert all(ctx is load_ctx for ctx in post_resume), post_resume
+    await persister.cleanup()
+
+
+def test_two_applications_do_not_share_a_serialization_context(tmp_path):
+    """No process-wide memo: two applications cannot see or pollute each other's cache."""
+    store = TrackedStore(str(tmp_path / "blobs3"))
+    a = _build_memo_app(store, "app-a", SYNC_MEMO).build()
+    b = _build_memo_app(store, "app-b", SYNC_MEMO).build()
+    ctx_a, ctx_b = _app_context(a), _app_context(b)
+    assert ctx_a is not ctx_b
+    ctx_a.memo["poison"] = "mine only"
+    assert ctx_b.memo == {}
+    # a serialization outside any application gets no context, so it cannot reach either memo
+    assert serde.get_serialization_context() is None
+
+
+def test_one_builder_reused_builds_independent_memos(tmp_path):
+    """A builder is a template: two builds from it must not inherit each other's cache."""
+    store = TrackedStore(str(tmp_path / "blobs4"))
+    builder = _build_memo_app(store, "reuse", SYNC_MEMO)
+    ctx1 = _app_context(builder.build())
+    ctx2 = _app_context(builder.build())
+    assert ctx1 is not ctx2
+    ctx1.memo["k"] = "first"
+    assert ctx2.memo == {}
+
+
+def test_hook_context_hands_the_same_object_every_dispatch(tmp_path):
+    """Every dispatch of one application reuses one context -- that is what makes the memo useful."""
+    store = TrackedStore(str(tmp_path / "blobs5"))
+    app = _build_memo_app(store, "single", SYNC_MEMO).build()
+    ctx = _app_context(app)
+    with app._adapter_set._hook_context():
+        assert serde.get_serialization_context() is ctx
+        with app._adapter_set._hook_context():
+            assert serde.get_serialization_context() is ctx
+    assert serde.get_serialization_context() is None
+
+
+def test_no_object_store_leaves_behaviour_unchanged(tmp_path):
+    """The compatibility bar: nothing installed, nothing shared, nothing about the type changed."""
+    builder = (
+        ApplicationBuilder()
+        .with_actions(**SYNC_MEMO["actions"])
+        .with_transitions(*SYNC_MEMO["transitions"])
+        .with_entrypoint(SYNC_MEMO["entrypoint"])
+        .with_identifiers(app_id="no-store", partition_key="pk")
+    )
+    assert builder._serialization_hook_context() is None
+    app = builder.build()
+    assert app._adapter_set._hook_context is None
+    # the memo is excluded from comparison and hashing, so the dataclass keeps the semantics it
+    # had before it existed
+    assert isinstance(hash(SerializationContext()), int)
+    store = TrackedStore(str(tmp_path / "blobs6"))
+    assert SerializationContext(object_store=store) == SerializationContext(object_store=store)
+    assert SerializationContext(object_store=store) != SerializationContext()
+    assert SerializationContext() != SerializationContext(object_store=store)
+    a, b = SerializationContext(), SerializationContext()
+    a.memo["x"] = 1
+    assert b.memo == {}
+    assert [f.name for f in dataclasses.fields(SerializationContext)] == ["object_store", "memo"]
+
+
+def test_memo_key_is_a_cache_key_not_an_identity_key(tmp_path):
+    """Two values with identical bytes but different metadata keep their own metadata.
+
+    The memo caches the ArtifactRef, never the payload, so `name` is always rebuilt from the live
+    value. This is the regression that caching the whole payload under sha256(data) would allow.
+    """
+    _register_memo_blob_serde("test_memo_metadata")
+    store = TrackedStore(str(tmp_path / "blobs_meta"))
+    ctx = SerializationContext(object_store=store)
+    with serde.serialization_context(ctx):
+        state = State(
+            {
+                "a": MemoBlob(b"same content", name="a.pdf"),
+                "b": MemoBlob(b"same content", name="b.pdf"),
+            }
+        )
+        serialized = state.serialize()
+    assert serialized["a"]["name"] == "a.pdf"
+    assert serialized["b"]["name"] == "b.pdf"
+    assert serialized["a"]["ref"] == serialized["b"]["ref"]  # same content, one artifact
+    assert len(store.ops) == 2  # one exists + one put covers both values
+
+    with serde.serialization_context(SerializationContext(object_store=store)):
+        restored = State.deserialize(serialized)
+    assert restored["a"].name == "a.pdf"
+    assert restored["b"].name == "b.pdf"
+    assert restored["a"].data == restored["b"].data == b"same content"
+
+
+def test_persister_and_tracker_share_the_memo_in_one_step(tmp_path):
+    """Two adapters serializing the same state in one step must make one store call, not two."""
+    _register_memo_blob_serde("test_persister_tracker")
+    store = TrackedStore(str(tmp_path / "blobs7"))
+    persister = SQLitePersister.from_values(db_path=str(tmp_path / "pt.db"), table_name="t")
+    persister.initialize()
+    tracker = LocalTrackingClient(project="memo-pt", storage_dir=str(tmp_path / "tracking"))
+
+    app = _build_memo_app(store, "pt", SYNC_MEMO, persister=persister, tracker=tracker).build()
+    app.run(halt_after=[SYNC_MEMO["halt_after"]])
+    assert store.ops.count(("put", len(MEMO_BYTES))) == 1, store.ops
+
+    log_path = os.path.join(str(tmp_path), "tracking", "memo-pt", "pt", "log.jsonl")
+    with open(log_path, encoding="utf-8") as f:
+        log = f.read()
+    assert "ArtifactRef" in log
+    assert MEMO_BYTES.decode() not in log  # the log holds a reference, not the payload
+
+    store.ops.clear()
+    resumed = _build_memo_app(
+        store, "pt", SYNC_MEMO, persister=persister, tracker=tracker, resume=True
+    ).build()
+    # deserialization is eager: resuming downloads the artifact once, through the two adapters
+    assert store.ops == [("get", len(MEMO_BYTES))], store.ops
+    store.ops.clear()
+
+    resumed.run(halt_after=[SYNC_MEMO["halt_after"]])
+    assert store.ops == [], store.ops
+    persister.cleanup()
